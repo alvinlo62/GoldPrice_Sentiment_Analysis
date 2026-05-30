@@ -5,13 +5,15 @@ from bs4 import BeautifulSoup
 import time
 import re
 import os
+from datetime import datetime
 import google.generativeai as genai
 from dotenv import load_dotenv
+from src.db_manager import GoldSentimentDB
 
 load_dotenv()
 
 class GoldSentimentAnalyzerV3:
-    def __init__(self):
+    def __init__(self, use_db=True):
         print("初始化系統...")
         
         api_key = os.getenv("GEMINI_API_KEY")
@@ -22,6 +24,20 @@ class GoldSentimentAnalyzerV3:
         self.llm_model = genai.GenerativeModel('gemini-3-flash-preview')
         
         self.headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+        
+        # 資料庫初始化
+        self.use_db = use_db
+        if use_db:
+            try:
+                self.db = GoldSentimentDB()
+                self.db.init_db()
+                print("資料庫連線成功")
+            except Exception as e:
+                print(f"資料庫連線失敗: {e}，將僅使用 CSV 儲存")
+                self.use_db = False
+                self.db = None
+        else:
+            self.db = None
 
     # 1. 直接從 yfinance 獲取新聞列表
     def get_news_list(self):
@@ -135,7 +151,7 @@ class GoldSentimentAnalyzerV3:
         except Exception as e:
             return 0.0, f"LLM Error: {str(e)}"
 
-    def run(self):
+    def run(self, save_csv=True):
             # A. 抓新聞
             df = self.get_news_list()
             if df.empty: return "No News Found"
@@ -163,9 +179,38 @@ class GoldSentimentAnalyzerV3:
             res_df = pd.DataFrame(llm_results)
             final_df = pd.concat([df, res_df], axis=1)
             
-            # 存檔
-            final_df.to_csv("Gold_Market_LLM_Analysis.csv", index=False, encoding="utf-8-sig")
-            print("--- 專案執行完成！結果已存入 Gold_Market_LLM_Analysis.csv ---")
+            # D. 存入資料庫
+            if self.use_db and self.db:
+                print("正在存入 PostgreSQL 資料庫...")
+                inserted_count = 0
+                today = datetime.now().strftime("%Y-%m-%d")
+                
+                for _, row in final_df.iterrows():
+                    news_data = {
+                        "date": today,
+                        "datetime": row.get('Date') if pd.notna(row.get('Date')) else datetime.now(),
+                        "title": row.get('Title'),
+                        "summary": row.get('Summary'),
+                        "link": row.get('Link'),
+                        "source": "Yahoo Finance",
+                        "full_content": row.get('Full_Content'),
+                        "final_text_for_ai": row.get('Final_Text_For_AI'),
+                        "llm_score": row.get('LLM_Score'),
+                        "llm_reason": row.get('LLM_Reason')
+                    }
+                    if self.db.insert_news(news_data):
+                        inserted_count += 1
+                
+                # 更新每日情緒分數
+                self.db.update_daily_sentiment(today)
+                print(f"--- 資料庫存入完成！新增 {inserted_count} 則新聞 ---")
+            
+            # E. 存 CSV（保留原有功能）
+            if save_csv:
+                final_df.to_csv(f"Gold_Market_LLM_Analysis_{today}.csv", index=False, encoding="utf-8-sig")
+                print(f"--- CSV 存檔完成：Gold_Market_LLM_Analysis_{today}.csv ---")
+            
+            print("--- 專案執行完成！---")
             return final_df
 
 # --- 啟動程序 ---
